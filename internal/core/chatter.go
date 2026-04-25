@@ -10,13 +10,13 @@ import (
 	"github.com/danielmiessler/fabric/internal/chat"
 
 	"github.com/danielmiessler/fabric/internal/domain"
+	"github.com/danielmiessler/fabric/internal/i18n"
+	debuglog "github.com/danielmiessler/fabric/internal/log"
 	"github.com/danielmiessler/fabric/internal/plugins/ai"
 	"github.com/danielmiessler/fabric/internal/plugins/db/fsdb"
 	"github.com/danielmiessler/fabric/internal/plugins/strategy"
 	"github.com/danielmiessler/fabric/internal/plugins/template"
 )
-
-const NoSessionPatternUserMessages = "no session, pattern or user messages provided"
 
 type Chatter struct {
 	db *fsdb.Db
@@ -27,11 +27,37 @@ type Chatter struct {
 	model              string
 	modelContextLength int
 	vendor             ai.Vendor
-	strategy           string
+}
+
+// recordFirstStreamError sends err to errChan if the channel is empty; subsequent errors are discarded.
+func recordFirstStreamError(errChan chan error, err error) {
+	if err == nil {
+		return
+	}
+
+	select {
+	case errChan <- err:
+	default:
+		// Second+ error discarded; log for observability
+		debuglog.Debug(debuglog.Wire, "additional stream error discarded: %v\n", err)
+	}
+}
+
+// joinPromptSections trims each part, drops empty ones, and joins the rest with newline separators.
+func joinPromptSections(parts ...string) string {
+	sections := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			sections = append(sections, trimmed)
+		}
+	}
+
+	return strings.Join(sections, "\n")
 }
 
 // Send processes a chat request and applies file changes for create_coding_feature pattern
-func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (session *fsdb.Session, err error) {
+func (o *Chatter) Send(ctx context.Context, request *domain.ChatRequest, opts *domain.ChatOptions) (session *fsdb.Session, err error) {
 	// Use o.model (normalized) for NeedsRawMode check instead of opts.Model
 	// This ensures case-insensitive model names work correctly (e.g., "GPT-5" → "gpt-5")
 	if o.vendor.NeedsRawMode(o.model) {
@@ -42,6 +68,16 @@ func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (s
 	}
 
 	vendorMessages := session.GetVendorMessages()
+
+	if debuglog.GetLevel() >= debuglog.Wire {
+		debuglog.Debug(debuglog.Wire, "FABRIC->LLM request messages (%d)\n", len(vendorMessages))
+		for i, msg := range vendorMessages {
+			debuglog.Debug(debuglog.Wire, "FABRIC->LLM [%d] role=%s content=%q\n", i, msg.Role, msg.Content)
+			if len(msg.MultiContent) > 0 {
+				debuglog.Debug(debuglog.Wire, "FABRIC->LLM [%d] parts=%d\n", i, len(msg.MultiContent))
+			}
+		}
+	}
 	if len(vendorMessages) == 0 {
 		if session.Name != "" {
 			err = o.db.Sessions.SaveSession(session)
@@ -49,7 +85,7 @@ func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (s
 				return
 			}
 		}
-		err = fmt.Errorf("no messages provided")
+		err = errors.New(i18n.T("chatter_error_no_messages_provided"))
 		return
 	}
 
@@ -64,27 +100,57 @@ func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (s
 	message := ""
 
 	if o.Stream {
-		responseChan := make(chan string)
+		responseChan := make(chan domain.StreamUpdate)
 		errChan := make(chan error, 1)
 		done := make(chan struct{})
 		printedStream := false
 
 		go func() {
 			defer close(done)
-			if streamErr := o.vendor.SendStream(session.GetVendorMessages(), opts, responseChan); streamErr != nil {
-				errChan <- streamErr
+			if streamErr := o.vendor.SendStream(ctx, session.GetVendorMessages(), opts, responseChan); streamErr != nil {
+				recordFirstStreamError(errChan, streamErr)
 			}
 		}()
 
-		for response := range responseChan {
-			message += response
-			if !opts.SuppressThink {
-				fmt.Print(response)
-				printedStream = true
+		for update := range responseChan {
+			if debuglog.GetLevel() >= debuglog.Wire {
+				debuglog.Debug(debuglog.Wire, "LLM->FABRIC stream update type=%s content=%q\n", update.Type, update.Content)
+				if update.Usage != nil {
+					debuglog.Debug(debuglog.Wire, "LLM->FABRIC stream usage input=%d output=%d total=%d\n", update.Usage.InputTokens, update.Usage.OutputTokens, update.Usage.TotalTokens)
+				}
+			}
+			if opts.UpdateChan != nil {
+				opts.UpdateChan <- update
+			}
+			switch update.Type {
+			case domain.StreamTypeContent:
+				message += update.Content
+				if !opts.SuppressThink && !opts.Quiet {
+					fmt.Print(update.Content)
+					printedStream = true
+				}
+			case domain.StreamTypeUsage:
+				if opts.ShowMetadata && update.Usage != nil && !opts.Quiet {
+					fmt.Fprintf(
+						os.Stderr,
+						"\n%s\n",
+						fmt.Sprintf(
+							i18n.T("chatter_log_stream_usage_metadata"),
+							update.Usage.InputTokens,
+							update.Usage.OutputTokens,
+							update.Usage.TotalTokens,
+						),
+					)
+				}
+			case domain.StreamTypeError:
+				if !opts.Quiet {
+					fmt.Fprintf(os.Stderr, "%s\n", fmt.Sprintf(i18n.T("chatter_error_stream_update"), update.Content))
+				}
+				recordFirstStreamError(errChan, errors.New(update.Content))
 			}
 		}
 
-		if printedStream && !opts.SuppressThink && !strings.HasSuffix(message, "\n") {
+		if printedStream && !opts.SuppressThink && !strings.HasSuffix(message, "\n") && !opts.Quiet {
 			fmt.Println()
 		}
 
@@ -102,8 +168,11 @@ func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (s
 			// No errors, continue
 		}
 	} else {
-		if message, err = o.vendor.Send(context.Background(), session.GetVendorMessages(), opts); err != nil {
+		if message, err = o.vendor.Send(ctx, session.GetVendorMessages(), opts); err != nil {
 			return
+		}
+		if debuglog.GetLevel() >= debuglog.Wire {
+			debuglog.Debug(debuglog.Wire, "LLM->FABRIC response content=%q\n", message)
 		}
 	}
 
@@ -113,7 +182,7 @@ func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (s
 
 	if message == "" {
 		session = nil
-		err = fmt.Errorf("empty response")
+		err = errors.New(i18n.T("chatter_error_empty_response"))
 		return
 	}
 
@@ -121,17 +190,17 @@ func (o *Chatter) Send(request *domain.ChatRequest, opts *domain.ChatOptions) (s
 	if request.PatternName == "create_coding_feature" {
 		summary, fileChanges, parseErr := domain.ParseFileChanges(message)
 		if parseErr != nil {
-			fmt.Printf("Warning: Failed to parse file changes: %v\n", parseErr)
+			fmt.Printf("%s\n", fmt.Sprintf(i18n.T("chatter_warning_parse_file_changes_failed"), parseErr))
 		} else if len(fileChanges) > 0 {
 			projectRoot, err := os.Getwd()
 			if err != nil {
-				fmt.Printf("Warning: Failed to get current directory: %v\n", err)
+				fmt.Printf("%s\n", fmt.Sprintf(i18n.T("chatter_warning_get_current_directory_failed"), err))
 			} else {
 				if applyErr := domain.ApplyFileChanges(projectRoot, fileChanges); applyErr != nil {
-					fmt.Printf("Warning: Failed to apply file changes: %v\n", applyErr)
+					fmt.Printf("%s\n", fmt.Sprintf(i18n.T("chatter_warning_apply_file_changes_failed"), applyErr))
 				} else {
-					fmt.Println("Successfully applied file changes.")
-					fmt.Printf("You can review the changes with 'git diff' if you're using git.\n\n")
+					fmt.Println(i18n.T("chatter_info_file_changes_applied_successfully"))
+					fmt.Printf("%s\n\n", i18n.T("chatter_help_review_changes_with_git_diff"))
 				}
 			}
 		}
@@ -150,7 +219,7 @@ func (o *Chatter) BuildSession(request *domain.ChatRequest, raw bool) (session *
 	if request.SessionName != "" {
 		var sess *fsdb.Session
 		if sess, err = o.db.Sessions.Get(request.SessionName); err != nil {
-			err = fmt.Errorf("could not find session %s: %v", request.SessionName, err)
+			err = fmt.Errorf(i18n.T("chatter_error_find_session"), request.SessionName, err)
 			return
 		}
 		session = sess
@@ -167,7 +236,7 @@ func (o *Chatter) BuildSession(request *domain.ChatRequest, raw bool) (session *
 	if request.ContextName != "" {
 		var ctx *fsdb.Context
 		if ctx, err = o.db.Contexts.Get(request.ContextName); err != nil {
-			err = fmt.Errorf("could not find context %s: %v", request.ContextName, err)
+			err = fmt.Errorf(i18n.T("chatter_error_find_context"), request.ContextName, err)
 			return
 		}
 		contextContent = ctx.Content
@@ -202,29 +271,28 @@ func (o *Chatter) BuildSession(request *domain.ChatRequest, raw bool) (session *
 		}
 
 		if err != nil {
-			return nil, fmt.Errorf("could not get pattern %s: %v", request.PatternName, err)
+			return nil, fmt.Errorf(i18n.T("chatter_error_get_pattern"), request.PatternName, err)
 		}
 		patternContent = pattern.Pattern
 		inputUsed = true
 	}
 
-	systemMessage := strings.TrimSpace(contextContent) + strings.TrimSpace(patternContent)
+	systemMessage := joinPromptSections(contextContent, patternContent)
 
 	if request.StrategyName != "" {
 		strategy, err := strategy.LoadStrategy(request.StrategyName)
 		if err != nil {
-			return nil, fmt.Errorf("could not load strategy %s: %v", request.StrategyName, err)
+			return nil, fmt.Errorf(i18n.T("chatter_error_load_strategy"), request.StrategyName, err)
 		}
 		if strategy != nil && strategy.Prompt != "" {
-			// prepend the strategy prompt to the system message
-			systemMessage = fmt.Sprintf("%s\n%s", strategy.Prompt, systemMessage)
+			systemMessage = joinPromptSections(strategy.Prompt, systemMessage)
 		}
 	}
 
 	// Apply refined language instruction if specified
 	if request.Language != "" && request.Language != "en" {
 		// Refined instruction: Execute pattern using user input, then translate the entire response.
-		systemMessage = fmt.Sprintf("%s\n\nIMPORTANT: First, execute the instructions provided in this prompt using the user's input. Second, ensure your entire final response, including any section headers or titles generated as part of executing the instructions, is written ONLY in the %s language.", systemMessage, request.Language)
+		systemMessage = fmt.Sprintf(i18n.T("chatter_prompt_enforce_response_language"), systemMessage, request.Language)
 	}
 
 	if raw {
@@ -279,7 +347,7 @@ func (o *Chatter) BuildSession(request *domain.ChatRequest, raw bool) (session *
 
 	if session.IsEmpty() {
 		session = nil
-		err = errors.New(NoSessionPatternUserMessages)
+		err = errors.New(i18n.T("chatter_error_no_session_pattern_user_messages"))
 	}
 	return
 }

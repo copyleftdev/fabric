@@ -1,10 +1,12 @@
 package anthropic
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/danielmiessler/fabric/internal/chat"
 	"github.com/danielmiessler/fabric/internal/domain"
 )
 
@@ -33,7 +35,7 @@ func TestNewClient_DefaultInitialization(t *testing.T) {
 func TestClientListModels(t *testing.T) {
 	client := NewClient()
 
-	models, err := client.ListModels()
+	models, err := client.ListModels(context.Background())
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
 	}
@@ -51,7 +53,7 @@ func TestClientListModels(t *testing.T) {
 
 func TestClient_ListModels_ReturnsCorrectModels(t *testing.T) {
 	client := NewClient()
-	models, err := client.ListModels()
+	models, err := client.ListModels(context.Background())
 
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
@@ -323,5 +325,42 @@ func TestBuildMessageParams_ExplicitTopP(t *testing.T) {
 	// TopP should be set when using non-default value
 	if params.TopP.Value != opts.TopP {
 		t.Errorf("Expected TopP %f, got %f", opts.TopP, params.TopP.Value)
+	}
+}
+
+func TestToMessages_MultiContentPDFAttachment(t *testing.T) {
+	client := NewClient()
+	msg := &chat.ChatCompletionMessage{
+		Role: chat.ChatMessageRoleUser,
+		MultiContent: []chat.ChatMessagePart{
+			{
+				Type: chat.ChatMessagePartTypeText,
+				Text: "Summarize this document.",
+			},
+			{
+				Type: chat.ChatMessagePartTypeImageURL,
+				ImageURL: &chat.ChatMessageImageURL{
+					URL: "data:application/pdf;base64,SGVsbG8=",
+				},
+			},
+		},
+	}
+
+	messages := client.toMessages([]*chat.ChatCompletionMessage{msg})
+	if len(messages) != 1 {
+		t.Fatalf("Expected 1 message, got %d", len(messages))
+	}
+	if len(messages[0].Content) != 2 {
+		t.Fatalf("Expected 2 content blocks, got %d", len(messages[0].Content))
+	}
+	if messages[0].Content[0].OfText == nil || messages[0].Content[0].OfText.Text != "Summarize this document." {
+		t.Fatalf("Expected first content block to be text, got %#v", messages[0].Content[0])
+	}
+	document := messages[0].Content[1].OfDocument
+	if document == nil || document.Source.OfBase64 == nil {
+		t.Fatalf("Expected second content block to be a base64 document, got %#v", messages[0].Content[1])
+	}
+	if document.Source.OfBase64.Data != "SGVsbG8=" {
+		t.Fatalf("Expected document data to match base64 payload, got %s", document.Source.OfBase64.Data)
 	}
 }

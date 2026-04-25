@@ -59,6 +59,7 @@ function __fabric_register_completions
 
         # Flag completions with arguments
         complete -c $cmd -s p -l pattern -d "Choose a pattern from the available patterns" -a "(__fabric_get_patterns)"
+        complete -c $cmd -l readpattern -d "Print the contents of the named pattern to the terminal" -a "(__fabric_get_patterns)"
         complete -c $cmd -s v -l variable -d "Values for pattern variables, e.g. -v=#role:expert -v=#points:30"
         complete -c $cmd -s C -l context -d "Choose a context from the available contexts" -a "(__fabric_get_contexts)"
         complete -c $cmd -l session -d "Choose a session from the available sessions" -a "(__fabric_get_sessions)"
@@ -73,6 +74,8 @@ function __fabric_register_completions
         complete -c $cmd -s o -l output -d "Output to file" -r
         complete -c $cmd -s n -l latest -d "Number of latest patterns to list (default: 0)"
         complete -c $cmd -s y -l youtube -d "YouTube video or play list URL to grab transcript, comments from it"
+        complete -c $cmd -l visual-sensitivity -d "Tolerance for FFmpeg scene detection (0.0 - 1.0)"
+        complete -c $cmd -l visual-fps -d "Extract a specific number of frames per second instead of using scene detection"
         complete -c $cmd -s g -l language -d "Specify the Language Code for the chat, e.g. -g=en -g=zh"
         complete -c $cmd -s u -l scrape_url -d "Scrape website URL to markdown using Jina AI"
         complete -c $cmd -s q -l scrape_question -d "Search question using Jina AI"
@@ -99,7 +102,7 @@ function __fabric_register_completions
         complete -c $cmd -l voice -d "TTS voice name for supported models (e.g., Kore, Charon, Puck)" -a "(__fabric_get_gemini_voices)"
         complete -c $cmd -l transcribe-file -d "Audio or video file to transcribe" -r -a "*.mp3 *.mp4 *.mpeg *.mpga *.m4a *.wav *.webm"
         complete -c $cmd -l transcribe-model -d "Model to use for transcription (separate from chat model)" -a "(__fabric_get_transcription_models)"
-        complete -c $cmd -l debug -d "Set debug level (0=off, 1=basic, 2=detailed, 3=trace)" -a "0 1 2 3"
+        complete -c $cmd -l debug -d "Set debug level (0=off, 1=basic, 2=detailed, 3=trace, 4=wire)" -a "0 1 2 3 4"
         complete -c $cmd -l notification-command -d "Custom command to run for notifications (overrides built-in notifications)"
 
         # Boolean flags (no arguments)
@@ -117,13 +120,14 @@ function __fabric_register_completions
         complete -c $cmd -l playlist -d "Prefer playlist over video if both ids are present in the URL"
         complete -c $cmd -l transcript -d "Grab transcript from YouTube video and send to chat"
         complete -c $cmd -l transcript-with-timestamps -d "Grab transcript from YouTube video with timestamps"
+        complete -c $cmd -l visual -d "Extract visual data from video using OCR and FFmpeg"
         complete -c $cmd -l comments -d "Grab comments from YouTube video and send to chat"
         complete -c $cmd -l metadata -d "Output video metadata"
         complete -c $cmd -l yt-dlp-args -d "Additional arguments to pass to yt-dlp (e.g. '--cookies-from-browser brave')"
         complete -c $cmd -l readability -d "Convert HTML input into a clean, readable view"
-       complete -c $cmd -l input-has-vars -d "Apply variables to user input"
-       complete -c $cmd -l no-variable-replacement -d "Disable pattern variable replacement"
-       complete -c $cmd -l dry-run -d "Show what would be sent to the model without actually sending it"
+        complete -c $cmd -l input-has-vars -d "Apply variables to user input"
+        complete -c $cmd -l no-variable-replacement -d "Disable pattern variable replacement"
+        complete -c $cmd -l dry-run -d "Show what would be sent to the model without actually sending it"
         complete -c $cmd -l search -d "Enable web search tool for supported models (Anthropic, OpenAI, Gemini)"
         complete -c $cmd -l serve -d "Serve the Fabric Rest API"
         complete -c $cmd -l serveOllama -d "Serve the Fabric Rest API with ollama endpoints"
@@ -138,6 +142,7 @@ function __fabric_register_completions
         complete -c $cmd -l split-media-file -d "Split audio/video files larger than 25MB using ffmpeg"
         complete -c $cmd -l notification -d "Send desktop notification when command completes"
         complete -c $cmd -s h -l help -d "Show this help message"
+        complete -c $cmd -l spotify -d 'Spotify podcast or episode URL to grab metadata'
 end
 
 __fabric_register_completions fabric

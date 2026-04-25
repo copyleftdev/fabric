@@ -1,6 +1,7 @@
 package dryrun
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 // Test generated using Keploy
 func TestListModels_ReturnsExpectedModel(t *testing.T) {
 	client := NewClient()
-	models, err := client.ListModels()
+	models, err := client.ListModels(context.Background())
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
 	}
@@ -39,16 +40,16 @@ func TestSendStream_SendsMessages(t *testing.T) {
 	opts := &domain.ChatOptions{
 		Model: "dry-run-model",
 	}
-	channel := make(chan string)
+	channel := make(chan domain.StreamUpdate)
 	go func() {
-		err := client.SendStream(msgs, opts, channel)
+		err := client.SendStream(context.Background(), msgs, opts, channel)
 		if err != nil {
 			t.Errorf("Expected no error, got %v", err)
 		}
 	}()
 	var receivedMessages []string
 	for msg := range channel {
-		receivedMessages = append(receivedMessages, msg)
+		receivedMessages = append(receivedMessages, msg.Content)
 	}
 	if len(receivedMessages) == 0 {
 		t.Errorf("Expected to receive messages, but got none")

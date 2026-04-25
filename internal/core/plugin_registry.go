@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +15,12 @@ import (
 	debuglog "github.com/danielmiessler/fabric/internal/log"
 	"github.com/danielmiessler/fabric/internal/plugins/ai/anthropic"
 	"github.com/danielmiessler/fabric/internal/plugins/ai/azure"
+	"github.com/danielmiessler/fabric/internal/plugins/ai/azure_entra"
+	"github.com/danielmiessler/fabric/internal/plugins/ai/azureaigateway"
 	"github.com/danielmiessler/fabric/internal/plugins/ai/bedrock"
+	"github.com/danielmiessler/fabric/internal/plugins/ai/codex"
+	"github.com/danielmiessler/fabric/internal/plugins/ai/copilot"
+	"github.com/danielmiessler/fabric/internal/plugins/ai/digitalocean"
 	"github.com/danielmiessler/fabric/internal/plugins/ai/dryrun"
 	"github.com/danielmiessler/fabric/internal/plugins/ai/exolab"
 	"github.com/danielmiessler/fabric/internal/plugins/ai/gemini"
@@ -36,40 +42,10 @@ import (
 	"github.com/danielmiessler/fabric/internal/tools/custom_patterns"
 	"github.com/danielmiessler/fabric/internal/tools/jina"
 	"github.com/danielmiessler/fabric/internal/tools/lang"
+	"github.com/danielmiessler/fabric/internal/tools/spotify"
 	"github.com/danielmiessler/fabric/internal/tools/youtube"
 	"github.com/danielmiessler/fabric/internal/util"
 )
-
-// hasAWSCredentials checks if Bedrock is properly configured by ensuring both
-// AWS credentials and BEDROCK_AWS_REGION are present. This prevents the Bedrock
-// client from being initialized when AWS credentials exist for other purposes.
-func hasAWSCredentials() bool {
-	// First check if BEDROCK_AWS_REGION is set - this is required for Bedrock
-	if os.Getenv("BEDROCK_AWS_REGION") == "" {
-		return false
-	}
-
-	// Then check if AWS credentials are available
-	if os.Getenv("AWS_PROFILE") != "" ||
-		os.Getenv("AWS_ROLE_SESSION_NAME") != "" ||
-		(os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "") {
-
-		return true
-	}
-
-	credFile := os.Getenv("AWS_SHARED_CREDENTIALS_FILE")
-	if credFile == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			credFile = filepath.Join(home, ".aws", "credentials")
-		}
-	}
-	if credFile != "" {
-		if _, err := os.Stat(credFile); err == nil {
-			return true
-		}
-	}
-	return false
-}
 
 func NewPluginRegistry(db *fsdb.Db) (ret *PluginRegistry, err error) {
 	ret = &PluginRegistry{
@@ -81,6 +57,7 @@ func NewPluginRegistry(db *fsdb.Db) (ret *PluginRegistry, err error) {
 		YouTube:        youtube.NewYouTube(),
 		Language:       lang.NewLanguage(),
 		Jina:           jina.NewClient(),
+		Spotify:        spotify.NewSpotify(),
 		Strategies:     strategy.NewStrategiesManager(),
 	}
 
@@ -98,19 +75,21 @@ func NewPluginRegistry(db *fsdb.Db) (ret *PluginRegistry, err error) {
 	// Add non-OpenAI compatible clients
 	vendors = append(vendors,
 		openai.NewClient(),
+		digitalocean.NewClient(),
 		ollama.NewClient(),
 		azure.NewClient(),
+		azureaigateway.NewClient(),
+		azure_entra.NewClient(),
 		gemini.NewClient(),
 		anthropic.NewClient(),
 		vertexai.NewClient(),
 		lmstudio.NewClient(),
 		exolab.NewClient(),
-		perplexity.NewClient(), // Added Perplexity client
+		perplexity.NewClient(),
+		codex.NewClient(),
+		copilot.NewClient(), // Microsoft 365 Copilot
+		bedrock.NewClient(), // AWS Bedrock - credentials configured via setup or AWS credential chain
 	)
-
-	if hasAWSCredentials() {
-		vendors = append(vendors, bedrock.NewClient())
-	}
 
 	// Add all OpenAI-compatible providers
 	for providerName := range openai_compatible.ProviderMap {
@@ -152,6 +131,7 @@ type PluginRegistry struct {
 	YouTube            *youtube.YouTube
 	Language           *lang.Language
 	Jina               *jina.Client
+	Spotify            *spotify.Spotify
 	TemplateExtensions *template.ExtensionManager
 	Strategies         *strategy.StrategiesManager
 }
@@ -171,6 +151,7 @@ func (o *PluginRegistry) SaveEnvFile() (err error) {
 
 	o.YouTube.SetupFillEnvFileContent(&envFileContent)
 	o.Jina.SetupFillEnvFileContent(&envFileContent)
+	o.Spotify.SetupFillEnvFileContent(&envFileContent)
 	o.Language.SetupFillEnvFileContent(&envFileContent)
 
 	err = o.Db.SaveEnv(envFileContent.String())
@@ -290,7 +271,7 @@ func (o *PluginRegistry) runVendorSetup() (err error) {
 	}
 
 	if setupQuestion.Value == "" {
-		return fmt.Errorf("%s", i18n.T("setup_no_ai_provider_selected"))
+		return errors.New(i18n.T("setup_no_ai_provider_selected"))
 	}
 
 	number, parseErr := strconv.Atoi(setupQuestion.Value)
@@ -344,7 +325,7 @@ func (o *PluginRegistry) runInteractiveSetup() (err error) {
 	groupsPlugins.AddGroupItems(i18n.T("setup_required_tools"), o.Defaults, o.PatternsLoader, o.Strategies)
 
 	// Add optional tools
-	groupsPlugins.AddGroupItems(i18n.T("setup_optional_configuration_header"), o.CustomPatterns, o.Jina, o.Language, o.YouTube)
+	groupsPlugins.AddGroupItems(i18n.T("setup_optional_configuration_header"), o.CustomPatterns, o.Jina, o.Language, o.Spotify, o.YouTube)
 
 	for {
 		groupsPlugins.Print(false)
@@ -468,7 +449,7 @@ func (o *PluginRegistry) Configure() (err error) {
 	o.ConfigureVendors()
 	_ = o.Defaults.Configure()
 	if err := o.CustomPatterns.Configure(); err != nil {
-		return fmt.Errorf("error configuring CustomPatterns: %w", err)
+		return fmt.Errorf(i18n.T("plugin_registry_error_configuring_custom_patterns"), err)
 	}
 	_ = o.PatternsLoader.Configure()
 
@@ -485,14 +466,15 @@ func (o *PluginRegistry) Configure() (err error) {
 		o.PatternsLoader.Patterns.CustomPatternsDir = customPatternsDir
 	}
 
-	//YouTube and Jina are not mandatory, so ignore not configured error
+	//YouTube, Jina, Spotify are not mandatory, so ignore not configured error
 	_ = o.YouTube.Configure()
 	_ = o.Jina.Configure()
+	_ = o.Spotify.Configure()
 	_ = o.Language.Configure()
 	return
 }
 
-func (o *PluginRegistry) GetChatter(model string, modelContextLength int, vendorName string, strategy string, stream bool, dryRun bool) (ret *Chatter, err error) {
+func (o *PluginRegistry) GetChatter(model string, modelContextLength int, vendorName string, stream bool, dryRun bool) (ret *Chatter, err error) {
 	ret = &Chatter{
 		db:     o.Db,
 		Stream: stream,
@@ -547,16 +529,39 @@ func (o *PluginRegistry) GetChatter(model string, modelContextLength int, vendor
 			vendorAvailable := lo.ContainsBy(availableVendors, func(name string) bool {
 				return strings.EqualFold(name, vendorName)
 			})
-			if ret.vendor == nil || !vendorAvailable {
-				err = fmt.Errorf("model %s not available for vendor %s", model, vendorName)
+			// Codex intentionally hides some subscription-backed models from model
+			// listings while still allowing explicit manual selection via -V Codex -m ...
+			allowCodexPassthrough := ret.vendor != nil &&
+				strings.EqualFold(ret.vendor.GetName(), "Codex") &&
+				len(availableVendors) == 0
+			if ret.vendor == nil || (!vendorAvailable && !allowCodexPassthrough) {
+				err = fmt.Errorf(i18n.T("plugin_registry_model_not_available_for_vendor"), model, vendorName)
 				return
 			}
 		} else {
-			availableVendors := models.FindGroupsByItem(model)
-			if len(availableVendors) > 1 {
-				debuglog.Log("Warning: multiple vendors provide model %s: %s. Using %s. Specify --vendor to select a vendor.\n", model, strings.Join(availableVendors, ", "), availableVendors[0])
+			// If the model wasn't found and contains a '/', try parsing the first
+			// segment as a vendor name (e.g. "ollama/llama3" -> vendor "ollama", model "llama3").
+			if actualModelName == "" {
+				if idx := strings.Index(model, "/"); idx > 0 {
+					prefix := model[:idx]
+					if v := vendorManager.FindByName(prefix); v != nil {
+						vendorName = prefix
+						model = model[idx+1:]
+						if normalized := models.FindModelNameCaseInsensitive(model); normalized != "" {
+							model = normalized
+						}
+						ret.vendor = v
+					}
+				}
 			}
-			ret.vendor = vendorManager.FindByName(models.FindGroupsByItemFirst(model))
+
+			if ret.vendor == nil {
+				availableVendors := models.FindGroupsByItem(model)
+				if len(availableVendors) > 1 {
+					debuglog.Log("Warning: multiple vendors provide model %s: %s. Using %s. Specify --vendor to select a vendor.\n", model, strings.Join(availableVendors, ", "), availableVendors[0])
+				}
+				ret.vendor = vendorManager.FindByName(models.FindGroupsByItemFirst(model))
+			}
 		}
 
 		ret.model = model
@@ -565,15 +570,14 @@ func (o *PluginRegistry) GetChatter(model string, modelContextLength int, vendor
 	if ret.vendor == nil {
 		var errMsg string
 		if defaultModel == "" || defaultVendor == "" {
-			errMsg = "Please run, fabric --setup, and select default model and vendor."
+			errMsg = i18n.T("plugin_registry_run_setup_select_defaults")
 		} else {
-			errMsg = "could not find vendor."
+			errMsg = i18n.T("plugin_registry_could_not_find_vendor")
 		}
 		err = fmt.Errorf(
 			" Requested Model = %s\n Default Model = %s\n Default Vendor = %s.\n\n%s",
 			model, defaultModel, defaultVendor, errMsg)
 		return
 	}
-	ret.strategy = strategy
 	return
 }

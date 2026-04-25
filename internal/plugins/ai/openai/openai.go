@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/danielmiessler/fabric/internal/chat"
 	"github.com/danielmiessler/fabric/internal/domain"
+	"github.com/danielmiessler/fabric/internal/i18n"
 	debuglog "github.com/danielmiessler/fabric/internal/log"
 	"github.com/danielmiessler/fabric/internal/plugins"
 	openai "github.com/openai/openai-go"
@@ -52,11 +54,7 @@ func NewClientCompatibleNoSetupQuestions(vendorName string, configureCustom func
 		configureCustom = ret.configure
 	}
 
-	ret.PluginBase = &plugins.PluginBase{
-		Name:            vendorName,
-		EnvNamePrefix:   plugins.BuildEnvVariablePrefix(vendorName),
-		ConfigureCustom: configureCustom,
-	}
+	ret.PluginBase = plugins.NewVendorPluginBase(vendorName, configureCustom)
 
 	return
 }
@@ -68,11 +66,43 @@ type Client struct {
 	ApiClient           *openai.Client
 	ImplementsResponses bool // Whether this provider supports the Responses API
 	httpClient          *http.Client
+	// webSearchToolName, when non-empty, overrides the default
+	// "web_search_preview" tool name emitted on the Responses API.
+	// Used by OpenAI-compatible providers whose upstream API expects a
+	// different tool type string (xAI expects "web_search").
+	webSearchToolName string
+	// enableXSearch, when true, appends an additional "x_search" tool
+	// entry alongside the web search tool when Search is enabled.
+	// This is an xAI-specific live search grounding tool.
+	enableXSearch bool
 }
 
 // SetResponsesAPIEnabled configures whether to use the Responses API
 func (o *Client) SetResponsesAPIEnabled(enabled bool) {
 	o.ImplementsResponses = enabled
+}
+
+// SetWebSearchToolName overrides the default "web_search_preview" tool
+// name emitted on the Responses API when Search is enabled. Pass an empty
+// string to keep the OpenAI default. Non-OpenAI providers (for example,
+// xAI) may require "web_search" instead.
+func (o *Client) SetWebSearchToolName(name string) {
+	o.webSearchToolName = name
+}
+
+// SetEnableXSearch toggles whether an additional xAI "x_search" tool
+// entry is appended when Search is enabled. Non-xAI providers should
+// leave this false.
+func (o *Client) SetEnableXSearch(enabled bool) {
+	o.enableXSearch = enabled
+}
+
+// checkImageGenerationCompatibility warns if the model doesn't support image generation
+func checkImageGenerationCompatibility(model string) {
+	if !supportsImageGeneration(model) {
+		fmt.Fprintf(os.Stderr, "%s", fmt.Sprintf(i18n.T("openai_warning_model_no_image_generation"),
+			model, strings.Join(ImageGenerationSupportedModels, ", ")))
+	}
 }
 
 func (o *Client) configure() (ret error) {
@@ -90,9 +120,9 @@ func (o *Client) configure() (ret error) {
 	return
 }
 
-func (o *Client) ListModels() (ret []string, err error) {
+func (o *Client) ListModels(ctx context.Context) (ret []string, err error) {
 	var page *pagination.Page[openai.Model]
-	if page, err = o.ApiClient.Models.List(context.Background()); err == nil {
+	if page, err = o.ApiClient.Models.List(ctx); err == nil {
 		for _, mod := range page.Data {
 			ret = append(ret, mod.ID)
 		}
@@ -104,31 +134,34 @@ func (o *Client) ListModels() (ret []string, err error) {
 	// Some providers (e.g., GitHub Models) return non-standard response formats
 	// that the SDK fails to parse.
 	debuglog.Debug(debuglog.Basic, "SDK Models.List failed for %s: %v, falling back to direct API fetch\n", o.GetName(), err)
-	return FetchModelsDirectly(context.Background(), o.ApiBaseURL.Value, o.ApiKey.Value, o.GetName(), o.httpClient)
+	return FetchModelsDirectly(ctx, o.ApiBaseURL.Value, o.ApiKey.Value, o.GetName(), o.httpClient)
 }
 
 func (o *Client) SendStream(
-	msgs []*chat.ChatCompletionMessage, opts *domain.ChatOptions, channel chan string,
+	ctx context.Context, msgs []*chat.ChatCompletionMessage, opts *domain.ChatOptions, channel chan domain.StreamUpdate,
 ) (err error) {
 	// Use Responses API for OpenAI, Chat Completions API for other providers
 	if o.supportsResponsesAPI() {
-		return o.sendStreamResponses(msgs, opts, channel)
+		return o.sendStreamResponses(ctx, msgs, opts, channel)
 	}
-	return o.sendStreamChatCompletions(msgs, opts, channel)
+	return o.sendStreamChatCompletions(ctx, msgs, opts, channel)
 }
 
 func (o *Client) sendStreamResponses(
-	msgs []*chat.ChatCompletionMessage, opts *domain.ChatOptions, channel chan string,
+	ctx context.Context, msgs []*chat.ChatCompletionMessage, opts *domain.ChatOptions, channel chan domain.StreamUpdate,
 ) (err error) {
 	defer close(channel)
 
 	req := o.buildResponseParams(msgs, opts)
-	stream := o.ApiClient.Responses.NewStreaming(context.Background(), req)
+	stream := o.ApiClient.Responses.NewStreaming(ctx, req)
 	for stream.Next() {
 		event := stream.Current()
 		switch event.Type {
 		case string(constant.ResponseOutputTextDelta("").Default()):
-			channel <- event.AsResponseOutputTextDelta().Delta
+			channel <- domain.StreamUpdate{
+				Type:    domain.StreamTypeContent,
+				Content: event.AsResponseOutputTextDelta().Delta,
+			}
 		case string(constant.ResponseOutputTextDone("").Default()):
 			// The Responses API sends the full text again in the
 			// final "done" event. Since we've already streamed all
@@ -138,7 +171,10 @@ func (o *Client) sendStreamResponses(
 		}
 	}
 	if stream.Err() == nil {
-		channel <- "\n"
+		channel <- domain.StreamUpdate{
+			Type:    domain.StreamTypeContent,
+			Content: "\n",
+		}
 	}
 	return stream.Err()
 }
@@ -152,9 +188,14 @@ func (o *Client) Send(ctx context.Context, msgs []*chat.ChatCompletionMessage, o
 }
 
 func (o *Client) sendResponses(ctx context.Context, msgs []*chat.ChatCompletionMessage, opts *domain.ChatOptions) (ret string, err error) {
+	// Warn if model doesn't support image generation when image file is specified
+	if opts.ImageFile != "" {
+		checkImageGenerationCompatibility(opts.Model)
+	}
+
 	// Validate model supports image generation if image file is specified
 	if opts.ImageFile != "" && !supportsImageGeneration(opts.Model) {
-		return "", fmt.Errorf("model '%s' does not support image generation. Supported models: %s", opts.Model, strings.Join(ImageGenerationSupportedModels, ", "))
+		return "", fmt.Errorf("%s", fmt.Sprintf(i18n.T("openai_model_no_image_generation"), opts.Model, strings.Join(ImageGenerationSupportedModels, ", ")))
 	}
 
 	req := o.buildResponseParams(msgs, opts)
@@ -236,11 +277,18 @@ func (o *Client) buildResponseParams(
 	// Add tools if enabled
 	var tools []responses.ToolUnionParam
 
-	// Add web search tool if enabled
+	// Add web search tool if enabled. The default tool name is OpenAI's
+	// "web_search_preview", but providers may override it (for example,
+	// xAI's Responses API requires "web_search").
 	if opts.Search {
-		webSearchTool := responses.ToolParamOfWebSearchPreview("web_search_preview")
+		searchToolName := responses.WebSearchToolType("web_search_preview")
+		if o.webSearchToolName != "" {
+			searchToolName = responses.WebSearchToolType(o.webSearchToolName)
+		}
+		webSearchTool := responses.ToolParamOfWebSearchPreview(searchToolName)
 
-		// Add user location if provided
+		// Add user location if provided. Only attach when the caller
+		// asked for it; xAI rejects unexpected location payloads.
 		if opts.SearchLocation != "" {
 			webSearchTool.OfWebSearchPreview.UserLocation = responses.WebSearchToolUserLocationParam{
 				Type:     "approximate",
@@ -249,6 +297,20 @@ func (o *Client) buildResponseParams(
 		}
 
 		tools = append(tools, webSearchTool)
+
+		// Append xAI's live "x_search" tool when the provider opts in.
+		// The xAI Responses API accepts a bare {"type":"x_search"}
+		// entry with no other required fields. We reuse the SDK's
+		// WebSearchToolParam as a minimal container since every other
+		// field is omitzero and will be elided during JSON marshalling.
+		if o.enableXSearch {
+			xSearchTool := responses.ToolUnionParam{
+				OfWebSearchPreview: &responses.WebSearchToolParam{
+					Type: responses.WebSearchToolType("x_search"),
+				},
+			}
+			tools = append(tools, xSearchTool)
+		}
 	}
 
 	// Add image generation tool if needed
@@ -287,6 +349,14 @@ func (o *Client) buildResponseParams(
 		}
 	}
 	return
+}
+
+// BuildResponseParams exposes the shared Responses API request builder so
+// auth-specialized vendors can reuse Fabric's OpenAI-compatible request shape.
+func (o *Client) BuildResponseParams(
+	inputMsgs []*chat.ChatCompletionMessage, opts *domain.ChatOptions,
+) responses.ResponseNewParams {
+	return o.buildResponseParams(inputMsgs, opts)
 }
 
 func convertMessage(msg chat.ChatCompletionMessage) responses.ResponseInputItemUnionParam {
@@ -351,4 +421,10 @@ func (o *Client) extractText(resp *responses.Response) (ret string) {
 	}
 
 	return
+}
+
+// ExtractText exposes the shared Responses API text extraction logic so other
+// vendors can reuse Fabric's response formatting and citation handling.
+func (o *Client) ExtractText(resp *responses.Response) string {
+	return o.extractText(resp)
 }
